@@ -4,13 +4,17 @@ import { beep, shutter } from '../lib/sound'
 import { Pill } from './ui'
 
 const SHOT_OPTIONS = [1, 2, 3, 4, 6]
-const TIMER_OPTIONS = [3, 5, 10, 0] // 0 = no timer, tap for each photo
+const TIMER_OPTIONS = [3, 5, 10, 0] // 0 = no countdown
+const MODES = [
+  { id: false, name: 'All at once' },
+  { id: true, name: 'One per tap' },
+]
 const ZOOM_STEPS = [1, 2, 3]
 const MAX_ZOOM = 3
 const SOUND_KEY = 'klovesnap-sound'
 
 // Settings carry over to the next session (like retaking one photo) so new shots match the rest.
-const remembered = { facing: 'user', filter: FILTERS[0], shotCount: 4, delay: 3, zoom: 1 }
+const remembered = { facing: 'user', filter: FILTERS[0], shotCount: 4, delay: 3, perTap: false, zoom: 1 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const cycle = (options, value) => options[(options.indexOf(value) + 1) % options.length]
@@ -36,8 +40,10 @@ export default function Booth({ onDone, single = false, onCancel }) {
   const [filter, setFilter] = useState(remembered.filter)
   const [shotCount, setShotCount] = useState(remembered.shotCount)
   const [delay, setDelay] = useState(remembered.delay)
+  const [perTap, setPerTap] = useState(remembered.perTap)
   const [sound, setSound] = useState(loadSoundSetting)
   const [running, setRunning] = useState(false)
+  const [shooting, setShooting] = useState(false) // a countdown or shot is in progress
   const [countdown, setCountdown] = useState(null)
   const [flashKey, setFlashKey] = useState(0)
   const [taken, setTaken] = useState(0)
@@ -46,12 +52,12 @@ export default function Booth({ onDone, single = false, onCancel }) {
   const pinchRef = useRef(null)
 
   const count = single ? 1 : shotCount
-  const manual = delay === 0
+  const tapEach = perTap && !single
 
   useEffect(() => {
     Object.assign(remembered, { facing, filter, delay, zoom })
-    if (!single) remembered.shotCount = shotCount
-  }, [facing, filter, delay, zoom, shotCount, single])
+    if (!single) Object.assign(remembered, { shotCount, perTap })
+  }, [facing, filter, delay, zoom, shotCount, perTap, single])
 
   function toggleSound() {
     setSound(!sound)
@@ -133,20 +139,28 @@ export default function Booth({ onDone, single = false, onCancel }) {
     onDone(shotsRef.current)
   }
 
+  // Counts down (if there's a timer), then takes one photo. Returns false if the booth closed meanwhile.
+  async function countdownAndSnap() {
+    for (let c = delay; c > 0; c--) {
+      setCountdown(c)
+      if (sound) beep(c === 1)
+      await sleep(1000)
+      if (cancelledRef.current) return false
+    }
+    setCountdown(null)
+    snap()
+    return true
+  }
+
+  // Takes every photo in a row, pausing briefly between them.
   async function startSession() {
     setRunning(true)
+    setShooting(true)
     setTaken(0)
     shotsRef.current = []
 
     for (let i = 0; i < count; i++) {
-      for (let c = delay; c > 0; c--) {
-        setCountdown(c)
-        if (sound) beep(c === 1)
-        await sleep(1000)
-        if (cancelledRef.current) return
-      }
-      setCountdown(null)
-      snap()
+      if (!(await countdownAndSnap())) return
       if (i < count - 1) {
         await sleep(700)
         if (cancelledRef.current) return
@@ -155,17 +169,28 @@ export default function Booth({ onDone, single = false, onCancel }) {
     finish()
   }
 
-  // Without a timer, each tap of the shutter takes the next photo.
-  function tapToSnap() {
+  // Each tap runs the timer and takes the next photo, so people can re-pose in between.
+  async function tapForNext() {
     if (!running) {
       shotsRef.current = []
+      setTaken(0)
       setRunning(true)
     }
-    snap()
+    setShooting(true)
+    if (!(await countdownAndSnap())) return
+    setShooting(false)
     if (shotsRef.current.length === count) finish()
   }
 
-  const iconButton = 'grid h-10 w-10 place-items-center rounded-full bg-black/30 text-white backdrop-blur active:scale-95'
+  function hint() {
+    if (shooting || (running && taken >= count)) return 'Smile!'
+    if (running) return `Tap for photo ${taken + 1} of ${count}`
+    if (cameraState !== 'ready') return ' '
+    if (single) return 'Tap to retake this photo'
+    return tapEach ? 'Tap once for each photo' : 'Tap to start'
+  }
+
+  const iconButton ='grid h-10 w-10 place-items-center rounded-full bg-black/30 text-white backdrop-blur active:scale-95'
 
   return (
     <div className="flex flex-1 flex-col">
@@ -262,14 +287,14 @@ export default function Booth({ onDone, single = false, onCancel }) {
           </Pill>
         )}
         <button
-          onClick={manual ? tapToSnap : startSession}
-          disabled={(running && (!manual || taken >= count)) || cameraState !== 'ready'}
-          aria-label={manual ? 'Take photo' : 'Start photobooth'}
+          onClick={tapEach ? tapForNext : startSession}
+          disabled={shooting || taken >= count || cameraState !== 'ready'}
+          aria-label={tapEach ? 'Take next photo' : 'Start photobooth'}
           className="group grid h-20 w-20 place-items-center rounded-full bg-white ring-4 ring-pink-200 transition active:scale-95 disabled:ring-stone-200"
         >
           <span
             className={`h-16 w-16 rounded-full bg-pink-500 transition-all duration-300 ${
-              running && !manual ? 'scale-50 rounded-xl' : 'group-disabled:bg-stone-300'
+              shooting ? 'scale-50 rounded-xl' : 'group-disabled:bg-stone-300'
             }`}
           />
         </button>
@@ -278,24 +303,26 @@ export default function Booth({ onDone, single = false, onCancel }) {
             <circle cx="12" cy="13" r="8" />
             <path d="M12 9v4l2.5 2M10 2h4" />
           </svg>
-          {manual ? 'Tap' : `${delay}s`}
+          {delay ? `${delay}s` : 'Off'}
         </Pill>
       </div>
-      <p className="mt-3 text-center text-xs text-stone-400">
-        {running && manual
-          ? taken < count
-            ? `Tap for photo ${taken + 1} of ${count}`
-            : 'Smile!'
-          : running
-            ? 'Smile!'
-            : cameraState !== 'ready'
-              ? ' '
-              : single
-                ? 'Tap to retake this photo'
-                : manual
-                  ? 'Tap the button for each photo'
-                  : 'Tap to start'}
-      </p>
+      {!single && (
+        <div className="mx-auto mt-4 grid w-fit grid-cols-2 rounded-full bg-stone-100 p-1">
+          {MODES.map((m) => (
+            <button
+              key={m.name}
+              onClick={() => setPerTap(m.id)}
+              disabled={running}
+              className={`rounded-full px-3 py-1.5 text-xs font-medium transition disabled:opacity-40 ${
+                perTap === m.id ? 'bg-white text-stone-900 shadow-sm' : 'text-stone-500'
+              }`}
+            >
+              {m.name}
+            </button>
+          ))}
+        </div>
+      )}
+      <p className="mt-3 text-center text-xs text-stone-400">{hint()}</p>
     </div>
   )
 }
